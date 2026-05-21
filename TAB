@@ -1,0 +1,296 @@
+import json
+import os
+import time
+from datetime import datetime
+import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from jose import jwt
+
+
+# CONFIG
+DB_USER = os.environ["user"]
+DB_PASSWORD = os.environ["password"]
+DB_HOST = os.environ["host"]
+
+DB_SENSORS = os.environ["dbname"]
+DB_ISSUES = os.environ["dbnamem"]
+
+REGION = os.environ["REGION"]
+USER_POOL_ID = os.environ["USER_POOL_ID"]
+
+AUTHORIZED_GROUP = "administrators"
+
+CACHE_TTL_SECONDS = 300
+_cache_data = None
+_cache_timestamp = None
+
+NOISE_FIELD = os.getenv("NOISE_FIELD", "").strip()
+
+
+# CONEXIÓN DB
+def get_sensors_connection():
+    return psycopg2.connect(
+        host=DB_HOST, database=DB_SENSORS, user=DB_USER, password=DB_PASSWORD
+    )
+
+def get_issues_connection():
+    return psycopg2.connect(
+        host=DB_HOST, database=DB_ISSUES, user=DB_USER, password=DB_PASSWORD
+    )
+
+
+# Token
+def decode_token(token, region, user_pool_id):
+    jwks_url = f"https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/jwks.json"
+    jwks = requests.get(jwks_url, timeout=5).json()["keys"]
+
+    headers = jwt.get_unverified_header(token)
+    kid = headers["kid"]
+
+    key = next((k for k in jwks if k["kid"] == kid), None)
+    if not key:
+        raise Exception("Clave pública no encontrada")
+
+    payload = jwt.decode(token, key, algorithms=["RS256"])
+
+    exp_date = datetime.fromtimestamp(int(payload["exp"]))
+    if exp_date < datetime.utcnow():
+        raise Exception("Token expirado")
+
+    return payload
+
+def validate_access(headers):
+    if not headers:
+        raise Exception("Token no enviado")
+
+    auth = headers.get("authorization") or headers.get("Authorization")
+    if not auth or not auth.startswith("Bearer "):
+        raise Exception("Token no enviado")
+
+    token = auth.replace("Bearer ", "").strip()
+    payload = decode_token(token, REGION, USER_POOL_ID)
+
+    groups = payload.get("cognito:groups", [])
+    if AUTHORIZED_GROUP not in groups:
+        raise Exception("No autorizado para acceder a este recurso")
+
+    return payload
+
+
+# ICA (PM2.5)
+def calculate_ica(pm25):
+    if pm25 is None:
+        return None
+    pm25 = float(pm25)
+
+    if pm25 <= 12:
+        return round((50 / 12) * pm25, 2)
+    elif pm25 <= 35.4:
+        return round(50 + (50 / (35.4 - 12)) * (pm25 - 12), 2)
+    elif pm25 <= 55.4:
+        return round(100 + (50 / (55.4 - 35.4)) * (pm25 - 35.4), 2)
+    elif pm25 <= 150:
+        return round(150 + (50 / (150 - 55.4)) * (pm25 - 55.4), 2)
+
+    return 200
+
+
+def query_station_locations():
+    conn = get_sensors_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    cur.execute("""
+        SELECT entity_code, latitude, longitude
+        FROM meteorological_stations;
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    locations = {}
+    for r in rows or []:
+        code = r.get("entity_code")
+        lat = r.get("latitude")
+        lon = r.get("longitude")
+        if not code or lat is None or lon is None:
+            continue
+        locations[code] = {"lat": float(lat), "lon": float(lon)}
+
+    return locations
+
+
+# QUERIES
+def query_environment_data():
+    conn = get_sensors_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+
+    cur.execute("""
+        SELECT pm25, date_registered
+        FROM environmental_readings
+        WHERE pm25 BETWEEN 1 AND 150
+        ORDER BY date_registered DESC
+        LIMIT 1;
+    """)
+    latest_ambiental = cur.fetchone()
+
+    cur.execute("""
+        SELECT *
+        FROM station_readings
+        ORDER BY date_registered DESC
+        LIMIT 1;
+    """)
+    latest_station = cur.fetchone()
+
+    cur.execute("""
+        SELECT AVG(pm25) AS avg_pm25
+        FROM environmental_readings
+        WHERE pm25 BETWEEN 1 AND 150
+        AND date_registered >= NOW() - INTERVAL '1 hour';
+    """)
+    avg_ambiental = cur.fetchone()
+
+    cur.execute("""
+        SELECT
+            date_trunc('minute', date_registered)
+            - (EXTRACT(minute FROM date_registered)::int % 5) * INTERVAL '1 minute'
+            AS bucket,
+            AVG(pm25) AS pm25_avg
+        FROM environmental_readings
+        WHERE pm25 BETWEEN 1 AND 150
+        AND date_registered >= NOW() - INTERVAL '24 hours'
+        GROUP BY 1
+        ORDER BY 1 ASC;
+    """)
+    trend_rows = cur.fetchall()
+
+    conn.close()
+
+    conn2 = get_issues_connection()
+    cur2 = conn2.cursor(cursor_factory=RealDictCursor)
+
+    cur2.execute("""
+        SELECT COUNT(*)::int AS open_count
+        FROM issue_reporting_citizen_participation
+        WHERE category @> ARRAY['ambiente_riesgos']
+        AND status IN ('open', 'in_progress')
+        AND is_deleted IS NOT TRUE;
+    """)
+    complaints = cur2.fetchone()
+
+    station_locations = query_station_locations()
+
+    conn2.close()
+
+    return {
+        "latest_ambiental": latest_ambiental,
+        "latest_station": latest_station,
+        "avg_ambiental": avg_ambiental,
+        "trend": trend_rows,
+        "complaints": complaints,
+        "station_locations": station_locations
+    }
+
+
+def build_response(data):
+    latest_ambiental = data["latest_ambiental"]
+    latest_station = data["latest_station"]
+    avg_pm25 = (data["avg_ambiental"] or {}).get("avg_pm25")
+    open_complaints = (data["complaints"] or {}).get("open_count", 0)
+    trend_rows = data["trend"] or []
+    station_locations = data.get("station_locations", {}) or {}
+    station_main_loc = station_locations.get("STATION_MAIN")
+    station_secondary_loc = station_locations.get("STATION_SECONDARY")
+
+    current_ica = calculate_ica(latest_ambiental["pm25"]) if latest_ambiental else None
+    average_ica = calculate_ica(avg_pm25) if avg_pm25 is not None else None
+
+    current_noise = None
+    if latest_station and NOISE_FIELD:
+        current_noise = latest_station.get(NOISE_FIELD)
+
+    ica_trend = []
+    for row in trend_rows:
+        pm25 = row.get("pm25_avg")
+        ts = row.get("bucket")
+        if pm25 is None or ts is None:
+            continue
+        ica_trend.append({
+            "timestamp": ts.isoformat(),
+            "value": calculate_ica(pm25)
+        })
+
+    station_status = [
+        {
+            "id": "STATION_MAIN",
+            "location": station_main_loc,
+            "currentICA": None,
+            "currentNoise": current_noise
+        },
+        {
+            "id": "STATION_SECONDARY",
+            "location": station_secondary_loc,
+            "currentICA": current_ica,
+            "currentNoise": None
+        }
+    ]
+
+    def criticity_score(s):
+        ica = s.get("currentICA") or 0
+        noise = s.get("currentNoise") or 0
+        return (ica * 10) + noise
+
+    stations_with_data = [
+        s for s in station_status
+        if s.get("currentICA") is not None or s.get("currentNoise") is not None
+    ]
+
+    critical = sorted(stations_with_data, key=criticity_score, reverse=True)[:5]
+
+    return {
+        "stationStatus": station_status,
+        "cityKPIs": {
+            "averageICA": average_ica,
+            "averageNoise": None,
+            "openComplaintsCount": open_complaints
+        },
+        "icaTrend24h": ica_trend,
+        "criticalStations": critical
+    }
+
+
+# CACHE
+def get_cached_or_query():
+    global _cache_data, _cache_timestamp
+
+    if _cache_data and _cache_timestamp:
+        if time.time() - _cache_timestamp < CACHE_TTL_SECONDS:
+            return _cache_data
+
+    fresh = query_environment_data()
+    _cache_data = fresh
+    _cache_timestamp = time.time()
+    return fresh
+
+
+# HANDLER
+def lambda_handler(event, context):
+    try:
+        path = event.get("rawPath", "")
+        method = event.get("requestContext", {}).get("http", {}).get("method", "")
+
+        if not (path == "/api/v1/environment/overview" and method == "GET"):
+            return {"statusCode": 404, "body": json.dumps({"error": "Endpoint no encontrado"})}
+
+        validate_access(event.get("headers", {}))
+
+        data = get_cached_or_query()
+        response = build_response(data)
+
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(response)
+        }
+
+    except Exception as e:
+        return {"statusCode": 401, "body": json.dumps({"error": str(e)})}
